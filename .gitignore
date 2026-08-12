@@ -1,3 +1,7 @@
 # OpenCodeBox session data (never commit)
 .opencode-data/
 project-data/
+
+# ProjectTXT artifacts (never commit)
+ProjectTXT
+ProjectTXT.txt
