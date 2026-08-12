@@ -9,3 +9,10 @@ ProjectTXT.txt
 # OpenCodeBox shared skills/commands (symlinks; never commit)
 .opencode/skills
 .opencode/command
+build/
+*.o
+*.a
+*.so
+*.spv
+node_modules/
+__pycache__/
