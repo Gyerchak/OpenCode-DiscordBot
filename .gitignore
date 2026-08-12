@@ -5,3 +5,7 @@ project-data/
 # ProjectTXT artifacts (never commit)
 ProjectTXT
 ProjectTXT.txt
+
+# OpenCodeBox shared skills/commands (symlinks; never commit)
+.opencode/skills
+.opencode/command
