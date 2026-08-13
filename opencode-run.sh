@@ -16,6 +16,7 @@ PROJ="OpenCode-DiscordBot"
 PROJ_DATA="$BOX_DIR/project-data"
 DATA="$PROJ_DATA/OpenCode-DiscordBot/.opencode-data"
 SESSIONS_DIR="$PROJ_DATA/OpenCode-DiscordBot/sessions"
+HANDOFFS_DIR="$PROJ_DATA/OpenCode-DiscordBot/handoffs"
 
 export OPENCODE_CONFIG="$PROJ_DATA/OpenCode-DiscordBot/opencode.json"
 
@@ -34,7 +35,7 @@ fi
 
 # "run" mode: inside the terminal window
 cd "$CONTAINER_DIR/$PROJ"
-mkdir -p "$DATA" "$SESSIONS_DIR"
+mkdir -p "$DATA" "$SESSIONS_DIR" "$HANDOFFS_DIR"
 if [ ! -e "$DATA/opencode/auth.json" ]; then
   mkdir -p "$DATA/opencode"
   ln -sf "$HOME/.local/share/opencode/auth.json" "$DATA/opencode/auth.json"
