@@ -16,3 +16,4 @@ build/
 *.spv
 node_modules/
 __pycache__/
+.opencode/agent
