@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=OpenCode-DiscordBot
+GenericName=OpenCodeBox project terminal
+Comment=Open the OpenCode-DiscordBot project terminal
+Exec=/run/media/hubertg/SONIC/OpenCodeBox/git-projects/OpenCode-DiscordBot/box/scripts/OpenCode-DiscordBot.sh launch
+TryExec=/run/media/hubertg/SONIC/OpenCodeBox/git-projects/OpenCode-DiscordBot/box/scripts/OpenCode-DiscordBot.sh
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
