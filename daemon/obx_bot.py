@@ -64,6 +64,7 @@ SVC_URL = CONFIG.get("service", {}).get("url", "http://127.0.0.1:49374")
 WHISPER_SOCK = CONFIG.get("whisper", {}).get("socket", "/tmp/opencode/whisper-server.sock")
 WHISPER_SERVER = CONFIG.get("whisper", {}).get("server", str(BOX / "tools/whisper-server.sh"))
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", CONFIG.get("whisper", {}).get("model", "medium"))
+WHISPER_LANG = os.environ.get("WHISPER_LANG", CONFIG.get("whisper", {}).get("lang", "en"))
 KOKORO_SOCK = CONFIG.get("kokoro", {}).get("socket", "/tmp/opencode/kokoro-server.sock")
 KOKORO_SERVER = CONFIG.get("kokoro", {}).get("server", str(BOX / "tools/kokoro-server.sh"))
 KEYS_ENV = CONFIG.get("token_keys_env", str(BOX / "box/TokenKeysMCP.env"))
@@ -302,6 +303,8 @@ def ensure_whisper() -> bool:
     try:
         env = dict(os.environ)
         env["WHISPER_MODEL"] = WHISPER_MODEL
+        if WHISPER_LANG:
+            env["WHISPER_LANG"] = WHISPER_LANG
         subprocess.Popen(
             [WHISPER_SERVER], env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1202,16 +1205,23 @@ def patch_pycord_receive():
                     try:
                         data = decoder.pop_data()
                     except Exception as e:
-                        # reset the decoder: a bad frame poisons it and every
-                        # subsequent frame fails ("corrupted stream" spam)
-                        try:
-                            decoder.reset()
-                        except Exception:
-                            pass
-                        now = time.monotonic()
-                        if now - _skip_last["t"] > 2.0:
-                            _skip_last["t"] = now
-                            print(f"[obx] skip bad frame ({type(e).__name__}) -> decoder reset", flush=True)
+                        # reset the decoder only after 2 CONSECUTIVE bad frames —
+                        # a single odd frame shouldn't disrupt a clean stream
+                        consec = _skip_last.setdefault("consec", {})
+                        k = id(decoder)
+                        consec[k] = consec.get(k, 0) + 1
+                        if consec[k] >= 2:
+                            try:
+                                decoder.reset()
+                            except Exception:
+                                pass
+                            consec.pop(k, None)
+                            now = time.monotonic()
+                            if now - _skip_last["t"] > 2.0:
+                                _skip_last["t"] = now
+                                print(f"[obx] skip bad frames ({type(e).__name__}) -> decoder reset", flush=True)
+                        elif len(consec) > 64:
+                            consec.pop(k, None)
                         continue
                     if data is not None:
                         try:
