@@ -17,10 +17,10 @@
   "min_text_gap_s": 1.5,
   "mirror_voice_to_text": true,
   "voice": {
-    "thr": 0.004,
+    "thr": 0.0035,
     "silence_s": 1.5,
     "max_s": 25
   },
-  "greet_on_join": true,
+  "greet_on_join": false,
   "mic_listen": false
 }

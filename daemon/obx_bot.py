@@ -76,6 +76,32 @@ V_MAX = float(VOICE_CFG.get("max_s", 25))
 MIRROR_VOICE = bool(CONFIG.get("mirror_voice_to_text", True))
 MIC_LISTEN = bool(CONFIG.get("mic_listen", False))  # local-mic bridge (default OFF — direct channel listening is the goal)
 
+# --- box voice layers (best-effort, fall back to agents.json voices) ---
+def _read_layered(path, default=""):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip() or default
+    except Exception:
+        return default
+
+
+BOX_VOICE_ACTIVE = _read_layered(str(BOX / "box/agents/voice/ACTIVE"), "")
+BOX_VOICEMODE_ACTIVE = _read_layered(str(BOX / "box/agents/voicemode/ACTIVE"), "5-full")
+BOX_VOICEENGINE_ACTIVE = _read_layered(str(BOX / "box/agents/voiceengine/ACTIVE"), "1-kokoro")
+BOX_VOICES = load_json(BOX / "box/agents/voice/voices.json", "voices.json")
+
+
+def resolve_agent_voice(name: str, cfg: dict) -> tuple[str, str]:
+    """(voice_slug, lang) for an agent: explicit cfg -> box voice layer -> default."""
+    voice = (cfg or {}).get("voice")
+    lang = (cfg or {}).get("lang", "a")
+    if not voice and BOX_VOICE_ACTIVE and BOX_VOICE_ACTIVE in BOX_VOICES:
+        entry = BOX_VOICES.get(BOX_VOICE_ACTIVE, {})
+        if entry.get("type") == "teto":
+            voice, lang = "jf_alpha", "j"
+        else:
+            voice, lang = entry.get("voice", "af_nicole"), "a"
+    return voice or "af_nicole", lang
+
 STATE_FILE = BASE / "state.json"
 
 
@@ -728,8 +754,7 @@ class VoiceRoom:
     async def speak(self, text: str):
         rt = self.bot.brain.agents.get(self.agent_name)
         cfg = rt.cfg if rt is not None else {}
-        voice = cfg.get("voice", "af_nicole")
-        lang = cfg.get("lang", "a")
+        voice, lang = resolve_agent_voice(self.agent_name, cfg)
         out = TMPDIR / f"obx-tts-{int(time.time() * 1000)}.wav"
         ok = await asyncio.to_thread(kokoro_synth, text, str(out), voice, lang)
         if not ok:
@@ -1139,6 +1164,8 @@ def patch_pycord_receive():
     # opus decode (mixed/odd frames). Skip bad packets instead of dying.
     from discord.voice.receive.router import PacketRouter as _PR
 
+    _skip_last = {"t": 0.0}
+
     def _do_run_fixed(self):
         while not self._end_thread.is_set():
             self.waiter.wait()
@@ -1147,7 +1174,16 @@ def patch_pycord_receive():
                     try:
                         data = decoder.pop_data()
                     except Exception as e:
-                        print(f"[obx] skip bad packet: {type(e).__name__}: {e}", flush=True)
+                        # reset the decoder: a bad frame poisons it and every
+                        # subsequent frame fails ("corrupted stream" spam)
+                        try:
+                            decoder.reset()
+                        except Exception:
+                            pass
+                        now = time.monotonic()
+                        if now - _skip_last["t"] > 2.0:
+                            _skip_last["t"] = now
+                            print(f"[obx] skip bad frame ({type(e).__name__}) -> decoder reset", flush=True)
                         continue
                     if data is not None:
                         try:
