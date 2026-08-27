@@ -71,9 +71,10 @@ TMPDIR = Path(CONFIG.get("tmp", "/tmp/opencode"))
 MIN_GAP = float(CONFIG.get("min_text_gap_s", 1.5))
 VOICE_CFG = CONFIG.get("voice", {})
 V_THR = float(VOICE_CFG.get("thr", 0.0035))
-V_SILENCE = float(VOICE_CFG.get("silence_s", 1.5))
+V_SILENCE = float(VOICE_CFG.get("silence_s", 2.0))  # 2s: fewer mid-sentence cuts
 V_MAX = float(VOICE_CFG.get("max_s", 25))
 MIRROR_VOICE = bool(CONFIG.get("mirror_voice_to_text", True))
+ASK_REPEAT = bool(CONFIG.get("voice", {}).get("ask_repeat", True))  # ask to repeat when unheard
 MIC_LISTEN = bool(CONFIG.get("mic_listen", False))  # local-mic bridge (default OFF — direct channel listening is the goal)
 
 # --- box voice layers (best-effort, fall back to agents.json voices) ---
@@ -577,6 +578,7 @@ class VoiceRoom:
         self._raw_last = time.monotonic()
         self._raw_probe_registered = False
         self.rawdump = str(TMPDIR / "obx-rawdump.bin")
+        self._last_repeat = 0.0
 
     def _raw_probe(self, data: bytes):
         """Called by py-cord's socket reader for EVERY raw UDP packet (pre-decrypt)."""
@@ -658,6 +660,15 @@ class VoiceRoom:
     async def _handle_utterance(self, pcm16k: bytes):
         if self.stopped or len(pcm16k) < 9600:  # <0.3s of 16k mono — ignore
             return
+        # trim leading/trailing silence edges — whisper hallucinates on them
+        a = np.frombuffer(pcm16k, dtype=np.int16).astype(np.float32) / 32768.0
+        mag = np.abs(a)
+        ons = np.where(mag > 0.01)[0]
+        if len(ons) > 0:
+            a0, a1 = max(0, int(ons[0] - 0.06 * 16000)), min(len(a), int(ons[-1] + 0.12 * 16000))
+            pcm16k = (a[a0:a1] * 32767).astype(np.int16).tobytes()
+        if len(pcm16k) < 9600:
+            return
         wav = TMPDIR / f"obx-voice-{int(time.time() * 1000)}.wav"
         text = ""
         try:
@@ -669,6 +680,7 @@ class VoiceRoom:
             text = await asyncio.to_thread(whisper_transcribe, str(wav))
             if not text or len(text) < 2:
                 print(f"[obx] whisper: empty on {len(pcm16k)/16000:.2f}s audio", flush=True)
+                await self._repeat_request(f"Sorry, I couldn't make that out — could you say it again?")
                 return
             print(f"[obx] voice[{self.agent_name}] heard: {text}", flush=True)
             if MIRROR_VOICE:
@@ -681,8 +693,17 @@ class VoiceRoom:
             if self.vc.is_playing():
                 self.vc.stop()  # interrupt: latest-wins
             rt = self.bot.brain.agent(self.agent_name) or self.bot.brain.agent("default")
-            answer = await rt.ask(f"(Discord voice #{self.channel.name}) listener said: {text}")
-            if not answer or answer.startswith("*brain"):
+            t0 = time.monotonic()
+            answer = await rt.ask(
+                f"A person is talking to you in the Discord voice channel {self.channel.name}. "
+                f'They said: "{text}"\n'
+                "Reply BRIEFLY and conversationally (max ~25 words) — as a natural spoken answer. "
+                "Do NOT mention the transcription, do not speculate about anything you did not hear, "
+                "and answer only what was asked."
+            )
+            print(f"[obx] brain {time.monotonic()-t0:.1f}s for {self.agent_name}", flush=True)
+            if (not answer) or answer.startswith("*brain"):
+                await self._repeat_request("Sorry, I had trouble forming an answer — could you repeat that?")
                 return
             print(f"[obx] voice[{self.agent_name}] says: {answer[:120]}", flush=True)
             await self.speak(answer)
@@ -741,6 +762,13 @@ class VoiceRoom:
                 wav.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    def _repeat_request(self, line: str):
+        now = time.monotonic()
+        if now - self._last_repeat < 8.0:
+            return asyncio.sleep(0)  # rate-limited prompt
+        self._last_repeat = now
+        return asyncio.ensure_future(self.speak(line))
 
     def _text_channel(self):
         try:

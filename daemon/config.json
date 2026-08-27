@@ -18,8 +18,9 @@
   "mirror_voice_to_text": true,
   "voice": {
     "thr": 0.0035,
-    "silence_s": 1.5,
-    "max_s": 25
+    "silence_s": 2.0,
+    "max_s": 25,
+    "ask_repeat": true
   },
   "greet_on_join": false,
   "mic_listen": false
