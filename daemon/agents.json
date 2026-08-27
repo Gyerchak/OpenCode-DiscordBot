@@ -1,0 +1,23 @@
+{
+  "default": {
+    "title": "obx-default",
+    "persona": "You are the default VibeCoder Discord chat agent.",
+    "voice": "af_nicole",
+    "lang": "a",
+    "enabled": true
+  },
+  "skebob": {
+    "title": "obx-skebob",
+    "persona": "You are Skebob, the main OpenCodeBox agent, talking in Discord.",
+    "voice": "jf_alpha",
+    "lang": "j",
+    "enabled": true
+  },
+  "build": {
+    "title": "obx-build",
+    "persona": "You are the build-mode agent, precise and practical.",
+    "voice": "am_michael",
+    "lang": "a",
+    "enabled": true
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "guild_id": "1521889213987946707",
+  "service": {
+    "url": "http://127.0.0.1:49374"
+  },
+  "whisper": {
+    "socket": "/tmp/opencode/whisper-server.sock",
+    "server": "/run/media/hubertg/SONIC/OpenCodeBox/tools/whisper-server.sh",
+    "model": "medium"
+  },
+  "kokoro": {
+    "socket": "/tmp/opencode/kokoro-server.sock",
+    "server": "/run/media/hubertg/SONIC/OpenCodeBox/tools/kokoro-server.sh"
+  },
+  "token_keys_env": "/run/media/hubertg/SONIC/OpenCodeBox/box/TokenKeysMCP.env",
+  "tmp": "/tmp/opencode",
+  "min_text_gap_s": 1.5,
+  "mirror_voice_to_text": true,
+  "voice": {
+    "thr": 0.004,
+    "silence_s": 1.5,
+    "max_s": 25
+  }
+}
