@@ -6,7 +6,7 @@
   "whisper": {
     "socket": "/tmp/opencode/whisper-server.sock",
     "server": "/run/media/hubertg/SONIC/OpenCodeBox/tools/whisper-server.sh",
-    "model": "large-v3",
+    "model": "medium",
     "lang": "",
     "compute": "int8"
   },
@@ -25,5 +25,5 @@
     "ask_repeat": true
   },
   "greet_on_join": false,
-  "mic_listen": false
+  "mic_listen": true
 }

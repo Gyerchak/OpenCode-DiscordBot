@@ -617,6 +617,7 @@ class VoiceRoom:
         self._last_repeat = 0.0
         self.busy_until = 0.0  # echo guard: ignore audio while (and just after) we speak
         self._processing = False
+        self._last_answer = 0.0  # anti-double-reply between mic & discord paths
 
     def _raw_probe(self, data: bytes):
         """Called by py-cord's socket reader for EVERY raw UDP packet (pre-decrypt)."""
@@ -703,6 +704,9 @@ class VoiceRoom:
             return
         if getattr(self, "_processing", False):
             print("[obx] drop utterance: still processing", flush=True)
+            return
+        if time.monotonic() - getattr(self, "_last_answer", 0.0) < 5.0:
+            print("[obx] drop utterance: already answered (mic path)", flush=True)
             return
         self._processing = True
         try:
@@ -871,6 +875,7 @@ class VoiceRoom:
             except Exception:
                 pass
             self.busy_until = time.monotonic() + dur + 2.5
+            self._last_answer = time.monotonic()
             try:
                 self.sink.pcm16 = bytearray()
                 self.sink.speaking = False
