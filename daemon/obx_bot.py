@@ -36,6 +36,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -73,6 +74,7 @@ V_THR = float(VOICE_CFG.get("thr", 0.004))
 V_SILENCE = float(VOICE_CFG.get("silence_s", 1.5))
 V_MAX = float(VOICE_CFG.get("max_s", 25))
 MIRROR_VOICE = bool(CONFIG.get("mirror_voice_to_text", True))
+MIC_LISTEN = bool(CONFIG.get("mic_listen", True))  # local-mic bridge (OBX-Talking style)
 
 STATE_FILE = BASE / "state.json"
 
@@ -375,6 +377,10 @@ class RoomSink(Sink):
         self.speaking = False
         self.last_sound = time.monotonic()
         self.buf_start = time.monotonic()
+        # receive diagnostics
+        self.frame_count = 0
+        self.seen_users = set()
+        self.last_hb = time.monotonic()
 
     def is_opus(self) -> bool:
         return False  # we want decoded PCM
@@ -389,24 +395,38 @@ class RoomSink(Sink):
         if not pcm:
             return
         try:
+            self.frame_count += 1
+            self.seen_users.add(str(getattr(user, "id", user)))
             stereo = len(pcm) >= 3840 and len(pcm) % 4 == 0
             a = np.frombuffer(pcm, dtype=np.int16)
             if stereo:
                 a = a.reshape(-1, 2).mean(axis=1).astype(np.int16)
             rms = float(np.sqrt(np.mean((a.astype(np.float32) / 32768.0) ** 2)))
+            was = self.speaking
             if rms > V_THR:
                 self.speaking = True
                 self.last_sound = time.monotonic()
+                if not was:
+                    print(f"[obx] VAD voice detected (rms={rms:.4f})", flush=True)
             if self.speaking:
                 self.pcm16.extend(a[::3].astype(np.int16).tobytes())  # 48k -> 16k
                 if time.monotonic() - self.buf_start > V_MAX:
                     self._flush("max")
+            now = time.monotonic()
+            if now - self.last_hb >= 5.0:
+                self.last_hb = now
+                print(
+                    f"[obx] recv hb: frames={self.frame_count} users={sorted(self.seen_users)[:4]} "
+                    f"rms={rms:.4f} speaking={self.speaking} buf={len(self.pcm16)}",
+                    flush=True,
+                )
         except Exception:
             pass
 
     def _flush(self, why: str):
         if self.pcm16:
             data = bytes(self.pcm16)
+            print(f"[obx] utterance flush ({why}): {len(data)} bytes {len(data)/32000:.2f}s", flush=True)
             self.pcm16 = bytearray()
             self.speaking = False
             self.buf_start = time.monotonic()
@@ -424,6 +444,87 @@ class RoomSink(Sink):
             self._flush("leave")
         except Exception:
             pass
+
+
+class MicListener(threading.Thread):
+    """Local-mic -> VAD -> whisper (the proven OBX-Talking path).
+
+    Captures the machine's default mic (PipeWire), waits for speech + trailing
+    silence, downsamples to 16k mono, transcribes via the persistent whisper
+    server and hands the text to the voice room. Bypasses Discord's voice
+    receiving entirely (DAVE/E2EE-proof).
+    """
+
+    def __init__(self, room: "VoiceRoom"):
+        super().__init__(daemon=True, name="obx-mic-listener")
+        self.room = room
+        self.stop_evt = threading.Event()
+
+    def run(self):
+        try:
+            src = subprocess.check_output(["pactl", "get-default-source"], text=True).strip()
+        except Exception as e:
+            print(f"[obx] mic: no default source ({e})", flush=True)
+            return
+        if not src:
+            return
+        try:
+            p = subprocess.Popen(
+                ["pw-cat", "-r", "--target", src, "--format=s16", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            print(f"[obx] mic: pw-cat failed ({e})", flush=True)
+            return
+        thr = 0.005
+        sil = 1.5
+        max_s = 20.0
+        spoke = False
+        last = 0.0
+        t0 = time.monotonic()
+        buf = []
+        leftover = b""
+        DS = 12  # 192k -> 16k
+        try:
+            while not self.stop_evt.is_set():
+                chunk = p.stdout.read(4096)
+                if not chunk:
+                    break
+                data = leftover + chunk
+                n = (len(data) // 2) * 2
+                arr = np.frombuffer(data[:n], dtype=np.int16).astype(np.float32) / 32768.0
+                leftover = data[n:]
+                if len(arr) == 0:
+                    continue
+                rms = float(np.sqrt(np.mean(arr * arr)))
+                if rms > thr:
+                    spoke = True
+                    last = time.monotonic()
+                    buf.append(arr)
+                elif spoke:
+                    if time.monotonic() - last > sil:
+                        break
+                    buf.append(arr)
+                if spoke and time.monotonic() - t0 > max_s:
+                    break
+        finally:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        if not spoke or not buf:
+            return
+        audio = np.concatenate(buf)
+        try:
+            idx = np.arange(0, len(audio), DS)
+            pcm16 = audio[idx].astype(np.int16)
+            # drop <1s of speech (noise)
+            if len(pcm16) < 16000:
+                return
+            print(f"[obx] mic utterance captured ({len(pcm16)/16000:.1f}s)", flush=True)
+            self.room.on_mic_utterance(pcm16.tobytes())
+        except Exception as e:
+            print(f"[obx] mic utterance error: {e}", flush=True)
 
 
 class VoiceRoom:
@@ -446,6 +547,11 @@ class VoiceRoom:
         except Exception as e:
             print(f"[obx] voice listen failed: {e} (DAVE/E2EE may block receiving)", flush=True)
         self._pump_task = asyncio.get_event_loop().create_task(self._pump_loop())
+        # local-mic bridge (OBX-Talking style) — hears the box's mic regardless of DAVE
+        if MIC_LISTEN and not self.stopped:
+            self.mic = MicListener(self)
+            self.mic.start()
+            print("[obx] local-mic listener started", flush=True)
         # proactive greeting: proves the speaker path + tells the human we're here
         greet = CONFIG.get("greet_on_join", True)
         if greet and not self.stopped:
@@ -511,6 +617,53 @@ class VoiceRoom:
             except Exception:
                 pass
 
+    def on_mic_utterance(self, pcm16k: bytes):
+        try:
+            loop = getattr(self, "loop", None) or self.bot.loop
+            loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._handle_mic_utterance(pcm16k))
+            )
+        except Exception:
+            pass
+
+    async def _handle_mic_utterance(self, pcm16k: bytes):
+        if self.stopped:
+            return
+        wav = TMPDIR / f"obx-mic-{int(time.time() * 1000)}.wav"
+        try:
+            with wave.open(str(wav), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm16k)
+            text = await asyncio.to_thread(whisper_transcribe, str(wav))
+            if not text or len(text) < 2:
+                return
+            print(f"[obx] mic[{self.agent_name}] heard: {text}", flush=True)
+            if MIRROR_VOICE:
+                txt_ch = self._text_channel()
+                if txt_ch:
+                    try:
+                        await txt_ch.send(f"🎙 *{text}*")
+                    except Exception:
+                        pass
+            if self.vc.is_playing():
+                self.vc.stop()  # interrupt: latest-wins
+            rt = self.bot.brain.agent(self.agent_name) or self.bot.brain.agent("default")
+            answer = await rt.ask(f"(Discord voice #{self.channel.name}) listener said: {text}")
+            if not answer or answer.startswith("*brain"):
+                return
+            print(f"[obx] mic[{self.agent_name}] says: {answer[:120]}", flush=True)
+            await self.speak(answer)
+        except Exception as e:
+            print(f"[obx] mic utterance error: {e}", flush=True)
+            traceback.print_exc()
+        finally:
+            try:
+                wav.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def _text_channel(self):
         try:
             for ch in self.channel.guild.channels:
@@ -521,7 +674,8 @@ class VoiceRoom:
         return None
 
     async def speak(self, text: str):
-        cfg = self.bot.brain.agents.get(self.agent_name, {})
+        rt = self.bot.brain.agents.get(self.agent_name)
+        cfg = rt.cfg if rt is not None else {}
         voice = cfg.get("voice", "af_nicole")
         lang = cfg.get("lang", "a")
         out = TMPDIR / f"obx-tts-{int(time.time() * 1000)}.wav"
@@ -531,20 +685,33 @@ class VoiceRoom:
             return
         try:
             if not self.vc.is_connected():
+                print("[obx] drop speak: not connected", flush=True)
                 return
             if self.vc.is_playing():
                 self.vc.stop()
-            self.vc.play(discord.FFmpegPCMAudio(str(out), executable="/usr/bin/ffmpeg"))
+            print(f"[obx] voice speaking ({voice}): {text[:120]}", flush=True)
+            # ffmpeg reads the file ASYNC — delete only after playback ends
+            def _cleanup(_e=None):
+                try:
+                    out.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self.vc.play(
+                discord.FFmpegPCMAudio(str(out), executable="/usr/bin/ffmpeg"),
+                after=_cleanup,
+            )
         except Exception as e:
             print(f"[obx] voice play error: {e}", flush=True)
-        finally:
-            try:
-                out.unlink(missing_ok=True)
-            except Exception:
-                pass
+            traceback.print_exc()
 
     async def stop(self):
         self.stopped = True
+        if getattr(self, "mic", None) is not None:
+            self.mic.stop_evt.set()
+            try:
+                self.mic.join(timeout=2)
+            except Exception:
+                pass
         if self._pump_task:
             self._pump_task.cancel()
         try:

@@ -21,5 +21,6 @@
     "silence_s": 1.5,
     "max_s": 25
   },
-  "greet_on_join": true
+  "greet_on_join": true,
+  "mic_listen": true
 }
