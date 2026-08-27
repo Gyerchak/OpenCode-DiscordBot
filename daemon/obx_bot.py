@@ -66,6 +66,7 @@ WHISPER_SERVER = CONFIG.get("whisper", {}).get("server", str(BOX / "tools/whispe
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", CONFIG.get("whisper", {}).get("model", "medium"))
 WHISPER_LANG = os.environ.get("WHISPER_LANG", CONFIG.get("whisper", {}).get("lang", "en"))
 WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", CONFIG.get("whisper", {}).get("compute", ""))
+WHISPER_CONF_MODE = bool(CONFIG.get("whisper", {}).get("conf_mode", True))
 KOKORO_SOCK = CONFIG.get("kokoro", {}).get("socket", "/tmp/opencode/kokoro-server.sock")
 KOKORO_SERVER = CONFIG.get("kokoro", {}).get("server", str(BOX / "tools/kokoro-server.sh"))
 KEYS_ENV = CONFIG.get("token_keys_env", str(BOX / "box/TokenKeysMCP.env"))
@@ -316,6 +317,8 @@ def ensure_whisper() -> bool:
             env["WHISPER_LANG"] = WHISPER_LANG
         if WHISPER_COMPUTE:
             env["WHISPER_COMPUTE"] = WHISPER_COMPUTE
+        if WHISPER_CONF_MODE:
+            env["WHISPER_CONF_MODE"] = "1"
         subprocess.Popen(
             [WHISPER_SERVER], env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -343,14 +346,23 @@ def whisper_transcribe(wav_path: str) -> str:
                 break
             buf += c
         s.close()
-        text = buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
-        if text.startswith("ERR"):
-            print(f"[obx] whisper: {text}", flush=True)
-            return ""
-        return text
+        raw = buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+        if raw.startswith("ERR"):
+            print(f"[obx] whisper: {raw}", flush=True)
+            return "", 0.0, 1.0
+        if "<::>" in raw:
+            parts = raw.split("<::>")
+            text = parts[0].strip()
+            try:
+                avg = float(parts[1])
+                nsp = float(parts[2])
+            except Exception:
+                avg, nsp = 0.0, 0.0
+            return text, avg, nsp
+        return raw, 0.0, 0.0
     except Exception as e:
         print(f"[obx] whisper error: {e}", flush=True)
-        return ""
+        return "", 0.0, 1.0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -594,6 +606,7 @@ class VoiceRoom:
         self.rawdump = str(TMPDIR / "obx-rawdump.bin")
         self._last_repeat = 0.0
         self.busy_until = 0.0  # echo guard: ignore audio while (and just after) we speak
+        self._processing = False
 
     def _raw_probe(self, data: bytes):
         """Called by py-cord's socket reader for EVERY raw UDP packet (pre-decrypt)."""
@@ -678,6 +691,18 @@ class VoiceRoom:
         if time.monotonic() < self.busy_until:
             print("[obx] echo suppressed (bot was speaking)", flush=True)
             return
+        if getattr(self, "_processing", False):
+            print("[obx] drop utterance: still processing", flush=True)
+            return
+        self._processing = True
+        try:
+            await self._process_uttered(pcm16k)
+        finally:
+            self._processing = False
+
+    async def _process_uttered(self, pcm16k: bytes):
+        if self.stopped or len(pcm16k) < 9600:
+            return
         # trim leading/trailing silence edges — whisper hallucinates on them
         a = np.frombuffer(pcm16k, dtype=np.int16).astype(np.float32) / 32768.0
         mag = np.abs(a)
@@ -695,10 +720,11 @@ class VoiceRoom:
                 w.setsampwidth(2)
                 w.setframerate(16000)
                 w.writeframes(pcm16k)
-            text = await asyncio.to_thread(whisper_transcribe, str(wav))
-            if not text or len(text) < 2:
-                print(f"[obx] whisper: empty on {len(pcm16k)/16000:.2f}s audio", flush=True)
-                await self._repeat_request(f"Sorry, I couldn't make that out — could you say it again?")
+            text, avg, nsp = await asyncio.to_thread(whisper_transcribe, str(wav))
+            confident = avg >= -0.8 and nsp < 0.7 and len(text) >= 2
+            if not confident:
+                print(f"[obx] whisper low-confidence ({avg:.2f}/{nsp:.2f}) on {len(pcm16k)/16000:.2f}s: '{text[:50]}'", flush=True)
+                await self._repeat_request("Sorry, I couldn't make that out — could you say it again?")
                 return
             print(f"[obx] voice[{self.agent_name}] heard: {text}", flush=True)
             if MIRROR_VOICE:
@@ -712,13 +738,22 @@ class VoiceRoom:
                 self.vc.stop()  # interrupt: latest-wins
             rt = self.bot.brain.agent(self.agent_name) or self.bot.brain.agent("default")
             t0 = time.monotonic()
-            answer = await rt.ask(
-                f"A person is talking to you in the Discord voice channel {self.channel.name}. "
-                f'They said: "{text}"\n'
-                "Reply BRIEFLY and conversationally (max ~25 words) — as a natural spoken answer. "
-                "Do NOT mention the transcription, do not speculate about anything you did not hear, "
-                "and answer only what was asked."
-            )
+            try:
+                answer = await asyncio.wait_for(
+                    rt.ask(
+                        f"A person is talking to you in the Discord voice channel {self.channel.name}. "
+                        f'They said: "{text}"\n'
+                        "Reply BRIEFLY and conversationally (max ~25 words) — as a natural spoken answer. "
+                        "If the transcript looks unclear, empty, or nonsensical, just say you didn't catch "
+                        "it and ask them to repeat. Do NOT mention the transcription, do NOT invent content "
+                        "the person did not say, and answer only what was asked."
+                    ),
+                    timeout=45,
+                )
+            except asyncio.TimeoutError:
+                print(f"[obx] brain timeout for {self.agent_name}", flush=True)
+                await self._repeat_request("I'm thinking — one moment, could you say that again?")
+                return
             print(f"[obx] brain {time.monotonic()-t0:.1f}s for {self.agent_name}", flush=True)
             if (not answer) or answer.startswith("*brain"):
                 await self._repeat_request("Sorry, I had trouble forming an answer — could you repeat that?")
@@ -753,8 +788,8 @@ class VoiceRoom:
                 w.setsampwidth(2)
                 w.setframerate(16000)
                 w.writeframes(pcm16k)
-            text = await asyncio.to_thread(whisper_transcribe, str(wav))
-            if not text or len(text) < 2:
+            text, avg, nsp = await asyncio.to_thread(whisper_transcribe, str(wav))
+            if not text or len(text) < 2 or (avg < -0.8 or nsp >= 0.7):
                 return
             print(f"[obx] mic[{self.agent_name}] heard: {text}", flush=True)
             if MIRROR_VOICE:
