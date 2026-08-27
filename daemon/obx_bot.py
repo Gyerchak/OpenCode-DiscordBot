@@ -550,6 +550,7 @@ class VoiceRoom:
         self._raw_count = 0
         self._raw_last = time.monotonic()
         self._raw_probe_registered = False
+        self.rawdump = str(TMPDIR / "obx-rawdump.bin")
 
     def _raw_probe(self, data: bytes):
         """Called by py-cord's socket reader for EVERY raw UDP packet (pre-decrypt)."""
@@ -557,9 +558,19 @@ class VoiceRoom:
         if self._raw_count == 20:
             self._raw_last = time.monotonic()
             print(f"[obx] RAW packets arriving ({self._raw_count} seen, last {len(data)}B)", flush=True)
+        # debug: keep a small packet dump for offline decrypt verification
+        if self._raw_count <= 300:
+            try:
+                with open(self.rawdump, "ab") as f:
+                    f.write(len(data).to_bytes(2, "big") + data)
+            except Exception:
+                pass
 
     def start(self):
         self.loop = self.bot.loop
+        # py-cord 2.8.1 never calls sink.init(vc) -> decoder asserts on sink.client
+        self.sink.vc = self.vc
+        self.sink._client = self.vc
         try:
             self.vc.start_listening(self.sink)
             print(f"[obx] listening in voice #{self.channel.name}", flush=True)
@@ -570,12 +581,20 @@ class VoiceRoom:
             if conn is not None and not self._raw_probe_registered:
                 conn.add_socket_listener(self._raw_probe)
                 self._raw_probe_registered = True
+            sk = getattr(conn, "secret_key", None) or getattr(self.vc, "secret_key", None)
+            sk_hex = sk.hex() if isinstance(sk, (bytes, bytearray)) else str(sk)
             print(
                 f"[obx] voice mode: {getattr(self.vc, 'mode', '?')} | "
-                f"supported: {getattr(self.vc, 'supported_modes', [])} | "
-                f"dave(privacy_code): {getattr(self.vc, 'voice_privacy_code', None)}",
+                f"dave(privacy_code): {getattr(self.vc, 'voice_privacy_code', None)} | "
+                f"key: {sk_hex[:32]}…",
                 flush=True,
             )
+            try:
+                Path(self.rawdump).write_bytes(
+                    f"mode={getattr(self.vc, 'mode', '?')}\nkey={sk_hex}\n".encode()
+                )
+            except Exception:
+                pass
         except Exception as e:
             print(f"[obx] probe setup failed: {e}", flush=True)
         self._pump_task = asyncio.get_event_loop().create_task(self._pump_loop())
@@ -1102,6 +1121,19 @@ def patch_pycord_receive():
         return r
 
     VoiceWebSocket.received_message = received_message_fixed
+
+    # surface the real router-loop exception (py-cord swallows it into logging)
+    from discord.voice.receive.router import PacketRouter as _PR
+    _orig_do_run = _PR._do_run
+
+    def _do_run_fixed(self):
+        try:
+            _orig_do_run(self)
+        except Exception:
+            print("[obx] ROUTER LOOP ERROR:\n" + traceback.format_exc(), flush=True)
+            raise
+
+    _PR._do_run = _do_run_fixed
     print("[obx] py-cord receive path patched (non-DAVE payloads + speaking ssrc map)", flush=True)
 
 
