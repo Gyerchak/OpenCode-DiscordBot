@@ -366,6 +366,10 @@ class RoomSink(Sink):
     """VAD-gated utterance capture. Receives decoded PCM (48 kHz) per user;
     keeps a mono 16 kHz mix and flushes whole utterances for the whisper brain."""
 
+    # py-cord 2.8 never defines this on the base Sink; the event router iterates
+    # it during registration — an empty list = no sink-side event listeners.
+    __sink_listeners__: list = []
+
     def __init__(self, room: "VoiceRoom"):
         super().__init__()
         self.room = room
@@ -434,6 +438,7 @@ class VoiceRoom:
         self._pump_task: asyncio.Task | None = None
 
     def start(self):
+        self.loop = self.bot.loop
         try:
             self.vc.start_listening(self.sink)
             print(f"[obx] listening in voice #{self.channel.name}", flush=True)
@@ -450,8 +455,9 @@ class VoiceRoom:
             await asyncio.sleep(0.25)
 
     def utterance_ready(self, pcm16k: bytes, why: str):
+        # called from py-cord's sink router THREAD — hand off to the bot loop
         try:
-            loop = asyncio.get_event_loop()
+            loop = getattr(self, "loop", None) or self.bot.loop
             loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self._handle_utterance(pcm16k)))
         except Exception:
             pass
@@ -566,14 +572,14 @@ class ObxBot(discord.Bot):
         self.voice_room: VoiceRoom | None = None
         self._leave_task: asyncio.Task | None = None
         # register /obx explicitly (bare decorators do not add commands in py-cord 2.8)
-        self.add_application_command(
-            discord.SlashCommand(
-                self.obx_cmd,
-                name="obx",
-                description="Talk with an agent (default unless named)",
-                guild_ids=[GUILD_ID],
+        for name, desc, handler in (
+            ("obx", "Talk with an agent (default unless named)", self.obx_cmd),
+            ("privacy", "OpenCodeBox privacy policy", self.privacy_cmd),
+            ("terms", "OpenCodeBox terms of service", self.terms_cmd),
+        ):
+            self.add_application_command(
+                discord.SlashCommand(handler, name=name, description=desc, guild_ids=[GUILD_ID])
             )
-        )
 
     # ── lifecycle ──
     async def on_ready(self):
@@ -645,6 +651,13 @@ class ObxBot(discord.Bot):
         prompt = message.strip() or "(Discord) start a conversation; greet the user here."
         who = f"(Discord #{getattr(ctx.channel, 'name', '?')}) user: {prompt}"
         self.brain.submit_text(name, "slash", ctx.channel, who, ctx=ctx)
+
+    # ── slash: /privacy and /terms ──
+    async def privacy_cmd(self, ctx: discord.ApplicationContext):
+        await ctx.respond("Privacy Policy: <https://gyerchak.github.io/OpenCode-DiscordBot/privacy-policy.html>")
+
+    async def terms_cmd(self, ctx: discord.ApplicationContext):
+        await ctx.respond("Terms of Service: <https://gyerchak.github.io/OpenCode-DiscordBot/terms-of-service.html>")
 
     # ── voice: auto join obx-* channels with humans, leave when empty ──
     async def on_voice_state_update(self, member, before, after):
