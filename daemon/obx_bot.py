@@ -190,8 +190,16 @@ class AgentRuntime:
                 self.session_id = s.get("id")
                 break
         if not self.session_id:
-            created = svc_request("POST", "/api/session", {"title": title}, timeout=30)
+            # real OpenCodeBox brain: create the session WITH the box agent
+            # ("agent" param — agentID is ignored). Bare sessions answer
+            # generically; agent sessions think with the box's setup/layers.
+            agent = self.cfg.get("agent", "Skebob")
+            created = svc_request(
+                "POST", "/api/session", {"title": title, "agent": agent}, timeout=30
+            )
             self.session_id = created.get("data", {}).get("id")
+            if self.session_id:
+                print(f"[obx] created session for '{self.name}' (agent={agent})", flush=True)
         if not self.session_id:
             print(f"[obx] WARN no session reachable for agent '{self.name}'", flush=True)
             return None
