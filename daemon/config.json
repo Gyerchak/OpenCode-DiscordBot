@@ -22,5 +22,5 @@
     "max_s": 25
   },
   "greet_on_join": true,
-  "mic_listen": true
+  "mic_listen": false
 }

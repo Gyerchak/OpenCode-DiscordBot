@@ -74,7 +74,7 @@ V_THR = float(VOICE_CFG.get("thr", 0.004))
 V_SILENCE = float(VOICE_CFG.get("silence_s", 1.5))
 V_MAX = float(VOICE_CFG.get("max_s", 25))
 MIRROR_VOICE = bool(CONFIG.get("mirror_voice_to_text", True))
-MIC_LISTEN = bool(CONFIG.get("mic_listen", True))  # local-mic bridge (OBX-Talking style)
+MIC_LISTEN = bool(CONFIG.get("mic_listen", False))  # local-mic bridge (default OFF — direct channel listening is the goal)
 
 STATE_FILE = BASE / "state.json"
 
@@ -539,6 +539,25 @@ class VoiceRoom:
         self.stopped = False
         self._pump_task: asyncio.Task | None = None
 
+    def __init__(self, bot, voice_client, agent_name, channel):
+        self.bot = bot
+        self.vc = voice_client
+        self.agent_name = agent_name
+        self.channel = channel
+        self.sink = RoomSink(self)
+        self.stopped = False
+        self._pump_task: asyncio.Task | None = None
+        self._raw_count = 0
+        self._raw_last = time.monotonic()
+        self._raw_probe_registered = False
+
+    def _raw_probe(self, data: bytes):
+        """Called by py-cord's socket reader for EVERY raw UDP packet (pre-decrypt)."""
+        self._raw_count += 1
+        if self._raw_count == 20:
+            self._raw_last = time.monotonic()
+            print(f"[obx] RAW packets arriving ({self._raw_count} seen, last {len(data)}B)", flush=True)
+
     def start(self):
         self.loop = self.bot.loop
         try:
@@ -546,6 +565,19 @@ class VoiceRoom:
             print(f"[obx] listening in voice #{self.channel.name}", flush=True)
         except Exception as e:
             print(f"[obx] voice listen failed: {e} (DAVE/E2EE may block receiving)", flush=True)
+        try:
+            conn = getattr(self.vc, "_connection", None)
+            if conn is not None and not self._raw_probe_registered:
+                conn.add_socket_listener(self._raw_probe)
+                self._raw_probe_registered = True
+            print(
+                f"[obx] voice mode: {getattr(self.vc, 'mode', '?')} | "
+                f"supported: {getattr(self.vc, 'supported_modes', [])} | "
+                f"dave(privacy_code): {getattr(self.vc, 'voice_privacy_code', None)}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[obx] probe setup failed: {e}", flush=True)
         self._pump_task = asyncio.get_event_loop().create_task(self._pump_loop())
         # local-mic bridge (OBX-Talking style) — hears the box's mic regardless of DAVE
         if MIC_LISTEN and not self.stopped:
@@ -1002,6 +1034,53 @@ def doctor() -> int:
     return 0 if tok and sess else 1
 
 
+def patch_pycord_receive():
+    """Fix py-cord 2.8.1: PacketDecryptor.decrypt_rtp drops non-DAVE payloads.
+
+    The upstream method computes `raw_payload = self._decryptor_rtp(packet)` but
+    only assigns it to packet.decrypted_data inside the DAVE branch — so in a
+    classic (non-DAVE) voice channel every packet returns None and the reader
+    drops them. We assign the classic payload ourselves.
+    """
+    try:
+        from discord.voice.receive.reader import PacketDecryptor
+        import davey
+    except Exception as e:
+        print(f"[obx] WARN cannot patch receive path: {e}", flush=True)
+        return
+
+    def decrypt_rtp_fixed(self, packet):
+        state = self.client._connection
+        dave = getattr(state, "dave_session", None)
+        try:
+            raw = self._decryptor_rtp(packet)
+        except Exception:
+            packet.decrypted_data = None
+            return packet.decrypted_data
+        # DAVE branch: keep upstream behaviour, degrade to classic on failure
+        if dave is not None and getattr(dave, "ready", False):
+            uid = state.ssrc_user_map.get(packet.ssrc)
+            if uid:
+                try:
+                    dec = dave.decrypt(uid, davey.MediaType.audio, raw)
+                    if packet.extended:
+                        off = packet.update_extended_header(dec)
+                        packet.decrypted_data = dec[off:]
+                    else:
+                        packet.decrypted_data = dec
+                except Exception:
+                    packet.decrypted_data = raw  # DAVE failed -> classic payload
+            else:
+                packet.decrypted_data = raw
+            return packet.decrypted_data
+        # classic (non-DAVE): upstream drops this silently — assign it
+        packet.decrypted_data = raw
+        return packet.decrypted_data
+
+    PacketDecryptor.decrypt_rtp = decrypt_rtp_fixed
+    print("[obx] py-cord receive path patched (non-DAVE payloads wired)", flush=True)
+
+
 def load_opus_safely() -> bool:
     if discord.opus.is_loaded():
         return True
@@ -1027,6 +1106,7 @@ def main() -> int:
     ensure_whisper()
     ensure_kokoro()
     load_opus_safely()
+    patch_pycord_receive()
     bot = ObxBot()
     try:
         bot.run(tok)
