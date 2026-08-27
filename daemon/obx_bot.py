@@ -333,36 +333,46 @@ def ensure_whisper() -> bool:
     return False
 
 
-def whisper_transcribe(wav_path: str) -> str:
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(30)
-        s.connect(WHISPER_SOCK)
-        s.sendall((wav_path + "\n").encode())
-        buf = b""
-        while b"\n" not in buf:
-            c = s.recv(4096)
-            if not c:
-                break
-            buf += c
-        s.close()
-        raw = buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
-        if raw.startswith("ERR"):
-            print(f"[obx] whisper: {raw}", flush=True)
-            return "", 0.0, 1.0
-        if "<::>" in raw:
-            parts = raw.split("<::>")
-            text = parts[0].strip()
-            try:
-                avg = float(parts[1])
-                nsp = float(parts[2])
-            except Exception:
-                avg, nsp = 0.0, 0.0
-            return text, avg, nsp
-        return raw, 0.0, 0.0
-    except Exception as e:
-        print(f"[obx] whisper error: {e}", flush=True)
-        return "", 0.0, 1.0
+def whisper_transcribe(wav_path: str):
+    """Transcribe; AUTO-HEALS: if the server is dead (crashed/OOM) restart it
+    and retry once — a down whisper server must never silently break replies."""
+    for attempt in range(2):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(90)
+            s.connect(WHISPER_SOCK)
+            s.sendall((wav_path + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                c = s.recv(4096)
+                if not c:
+                    break
+                buf += c
+            s.close()
+            raw = buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+            if raw.startswith("ERR"):
+                print(f"[obx] whisper: {raw}", flush=True)
+                if "memory" in raw or "invalid device" in raw.lower():
+                    # transient GPU failure — restart the server and retry once
+                    ensure_whisper()
+                    time.sleep(2)
+                    continue
+                return "", 0.0, 1.0
+            if "<::>" in raw:
+                parts = raw.split("<::>")
+                text = parts[0].strip()
+                try:
+                    avg = float(parts[1])
+                    nsp = float(parts[2])
+                except Exception:
+                    avg, nsp = 0.0, 0.0
+                return text, avg, nsp
+            return raw, 0.0, 0.0
+        except Exception as e:
+            print(f"[obx] whisper error: {e} — restarting server", flush=True)
+            ensure_whisper()
+            time.sleep(2)
+    return "", 0.0, 1.0
 
 
 # ──────────────────────────────────────────────────────────────────────
