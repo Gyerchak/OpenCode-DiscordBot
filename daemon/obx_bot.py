@@ -593,6 +593,7 @@ class VoiceRoom:
         self._raw_probe_registered = False
         self.rawdump = str(TMPDIR / "obx-rawdump.bin")
         self._last_repeat = 0.0
+        self.busy_until = 0.0  # echo guard: ignore audio while (and just after) we speak
 
     def _raw_probe(self, data: bytes):
         """Called by py-cord's socket reader for EVERY raw UDP packet (pre-decrypt)."""
@@ -673,6 +674,9 @@ class VoiceRoom:
 
     async def _handle_utterance(self, pcm16k: bytes):
         if self.stopped or len(pcm16k) < 9600:  # <0.3s of 16k mono — ignore
+            return
+        if time.monotonic() < self.busy_until:
+            print("[obx] echo suppressed (bot was speaking)", flush=True)
             return
         # trim leading/trailing silence edges — whisper hallucinates on them
         a = np.frombuffer(pcm16k, dtype=np.int16).astype(np.float32) / 32768.0
@@ -808,7 +812,21 @@ class VoiceRoom:
                 return
             if self.vc.is_playing():
                 self.vc.stop()
-            print(f"[obx] voice speaking ({voice}): {text[:120]}", flush=True)
+            # echo guard: forget captured audio + ignore input until playback
+            # ends plus a short tail (speaker->mic pickup latency)
+            dur = 0.0
+            try:
+                with wave.open(str(out), "rb") as w:
+                    dur = w.getnframes() / float(w.getframerate())
+            except Exception:
+                pass
+            self.busy_until = time.monotonic() + dur + 2.5
+            try:
+                self.sink.pcm16 = bytearray()
+                self.sink.speaking = False
+            except Exception:
+                pass
+            print(f"[obx] voice speaking ({voice}): {text[:120]} (busy {dur+2.5:.1f}s)", flush=True)
             # ffmpeg reads the file ASYNC — delete only after playback ends
             def _cleanup(_e=None):
                 try:
