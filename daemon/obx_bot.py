@@ -721,7 +721,12 @@ class VoiceRoom:
                 w.setframerate(16000)
                 w.writeframes(pcm16k)
             text, avg, nsp = await asyncio.to_thread(whisper_transcribe, str(wav))
-            confident = avg >= -0.8 and nsp < 0.7 and len(text) >= 2
+            # calibrated: real noisy Discord speech scores avg ~ -0.7..-1.5
+            confident = avg >= -1.5 and nsp < 0.9 and len(text) >= 2
+            low = text.lower()
+            if any(x in low for x in ("subtitle workshop", "thanks for watching", "thank you for watching", "adding subtitles")):
+                print(f"[obx] known whisper hallucination filtered: '{text[:40]}'", flush=True)
+                confident = False
             if not confident:
                 print(f"[obx] whisper low-confidence ({avg:.2f}/{nsp:.2f}) on {len(pcm16k)/16000:.2f}s: '{text[:50]}'", flush=True)
                 await self._repeat_request("Sorry, I couldn't make that out — could you say it again?")
