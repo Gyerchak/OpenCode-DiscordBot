@@ -1044,6 +1044,8 @@ def patch_pycord_receive():
     """
     try:
         from discord.voice.receive.reader import PacketDecryptor
+        from discord.voice.gateway import VoiceWebSocket
+        from discord.voice.enums import OpCodes
         import davey
     except Exception as e:
         print(f"[obx] WARN cannot patch receive path: {e}", flush=True)
@@ -1078,7 +1080,29 @@ def patch_pycord_receive():
         return packet.decrypted_data
 
     PacketDecryptor.decrypt_rtp = decrypt_rtp_fixed
-    print("[obx] py-cord receive path patched (non-DAVE payloads wired)", flush=True)
+
+    # py-cord 2.8.1 second bug: no inbound handler for OpCodes.speaking (opcode 5),
+    # so ssrc_user_map stays empty and the reader drops EVERY packet (RTPPacket
+    # .is_silence() is a stub returning True). Map user_id<->ssrc ourselves.
+    _orig_received_message = VoiceWebSocket.received_message
+
+    async def received_message_fixed(self, msg, /):
+        r = await _orig_received_message(self, msg)
+        try:
+            if msg.get("op") == int(OpCodes.speaking):
+                d = msg.get("d") or {}
+                uid, ssrc = d.get("user_id"), d.get("ssrc")
+                if uid is not None and ssrc is not None:
+                    conn = getattr(self, "state", None)
+                    vc = getattr(conn, "client", None)
+                    if vc is not None:
+                        vc._add_ssrc(int(uid), int(ssrc))
+        except Exception:
+            pass
+        return r
+
+    VoiceWebSocket.received_message = received_message_fixed
+    print("[obx] py-cord receive path patched (non-DAVE payloads + speaking ssrc map)", flush=True)
 
 
 def load_opus_safely() -> bool:
