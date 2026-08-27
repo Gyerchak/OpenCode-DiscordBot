@@ -65,6 +65,7 @@ WHISPER_SOCK = CONFIG.get("whisper", {}).get("socket", "/tmp/opencode/whisper-se
 WHISPER_SERVER = CONFIG.get("whisper", {}).get("server", str(BOX / "tools/whisper-server.sh"))
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", CONFIG.get("whisper", {}).get("model", "medium"))
 WHISPER_LANG = os.environ.get("WHISPER_LANG", CONFIG.get("whisper", {}).get("lang", "en"))
+WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", CONFIG.get("whisper", {}).get("compute", ""))
 KOKORO_SOCK = CONFIG.get("kokoro", {}).get("socket", "/tmp/opencode/kokoro-server.sock")
 KOKORO_SERVER = CONFIG.get("kokoro", {}).get("server", str(BOX / "tools/kokoro-server.sh"))
 KEYS_ENV = CONFIG.get("token_keys_env", str(BOX / "box/TokenKeysMCP.env"))
@@ -313,6 +314,8 @@ def ensure_whisper() -> bool:
         env["WHISPER_MODEL"] = WHISPER_MODEL
         if WHISPER_LANG:
             env["WHISPER_LANG"] = WHISPER_LANG
+        if WHISPER_COMPUTE:
+            env["WHISPER_COMPUTE"] = WHISPER_COMPUTE
         subprocess.Popen(
             [WHISPER_SERVER], env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
