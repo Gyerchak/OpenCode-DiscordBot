@@ -744,7 +744,8 @@ def app_intents() -> str:
         if limited:
             return (
                 "LIMITED — message content only when mentioned/replied/DM'd. "
-                "Verify the app in the Discord Developer Portal to unlock passive obx-* reading."
+                "Fix: Developer Portal → Bot → Privileged Gateway Intents → toggle MESSAGE CONTENT "
+                "(apps under 10k users can self-serve; then restart the daemon)."
             )
         return "no message-content flags set"
     except Exception as e:

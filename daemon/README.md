@@ -35,10 +35,10 @@ apps/obx-discordbot-daemon stop|restart
 
 ## Caveats (read!)
 1. **Message content LIMITED**: this app is unverified, so Discord only delivers
-   message *content* when the bot is mentioned, replied-to, or DM'd. Passive
-   "read every obx-* message without being addressed" requires **verification** of
-   the application in the Discord Developer Portal (user action). Until then,
-   address the bot in `obx-*` channels (mention/reply) — replies still work.
+   message *content* when the bot is mentioned, replied-to, or DM'd. Fix
+   (apps under 10k users, no verification needed): Developer Portal → Bot →
+   **Privileged Gateway Intents → toggle MESSAGE CONTENT**, then restart the
+   daemon. Full App verification also unlocks it (identity check via Stripe).
 2. **Voice receive vs DAVE**: Discord's E2EE (DAVE) rollout can block voice
    *listening* on some servers. Send works regardless. If the log shows
    "voice listen failed", passive voice listening is blocked server-side.
