@@ -20,5 +20,6 @@
     "thr": 0.004,
     "silence_s": 1.5,
     "max_s": 25
-  }
+  },
+  "greet_on_join": true
 }

@@ -28,8 +28,6 @@ Env:    BOX (box root) overrides config.json;
         WHISPER_MODEL overrides the whisper model.
 """
 
-from __future__ import annotations
-
 import asyncio
 import base64
 import json
@@ -381,6 +379,9 @@ class RoomSink(Sink):
     def is_opus(self) -> bool:
         return False  # we want decoded PCM
 
+    def walk_children(self, *, with_self: bool = True) -> list:
+        return []  # no child sinks
+
     def write(self, data, user):
         if user is None or getattr(user, "bot", False):
             return
@@ -445,6 +446,15 @@ class VoiceRoom:
         except Exception as e:
             print(f"[obx] voice listen failed: {e} (DAVE/E2EE may block receiving)", flush=True)
         self._pump_task = asyncio.get_event_loop().create_task(self._pump_loop())
+        # proactive greeting: proves the speaker path + tells the human we're here
+        greet = CONFIG.get("greet_on_join", True)
+        if greet and not self.stopped:
+            async def _greet():
+                await asyncio.sleep(1.5)
+                await self.speak(
+                    f"I'm here in {self.channel.name}. Say something and I will answer."
+                )
+            asyncio.ensure_future(_greet())
 
     async def _pump_loop(self):
         while not self.stopped:
@@ -571,11 +581,13 @@ class ObxBot(discord.Bot):
         self.brain = Brain()
         self.voice_room: VoiceRoom | None = None
         self._leave_task: asyncio.Task | None = None
+        self._joining = False
         # register /obx explicitly (bare decorators do not add commands in py-cord 2.8)
         for name, desc, handler in (
             ("obx", "Talk with an agent (default unless named)", self.obx_cmd),
             ("privacy", "OpenCodeBox privacy policy", self.privacy_cmd),
             ("terms", "OpenCodeBox terms of service", self.terms_cmd),
+            ("speak", "Make the bot say something in the voice channel it is in", self.speak_cmd),
         ):
             self.add_application_command(
                 discord.SlashCommand(handler, name=name, description=desc, guild_ids=[GUILD_ID])
@@ -653,6 +665,28 @@ class ObxBot(discord.Bot):
         self.brain.submit_text(name, "slash", ctx.channel, who, ctx=ctx)
 
     # ── slash: /privacy and /terms ──
+    async def speak_cmd(self, ctx, text: str = ""):
+        try:
+            await ctx.defer()
+        except Exception:
+            pass
+        try:
+            room = self.voice_room
+            if room is None or not room.vc.is_connected():
+                await ctx.respond("I'm not in a voice channel. Join an `obx-*` voice channel first.")
+                return
+            line = text.strip() or "Hello! This is a voice test."
+            await room.speak(line)
+            await ctx.respond(f"🔊 said: {line[:120]}")
+            return line
+        except Exception as e:
+            print(f"[obx] /speak error: {e}", flush=True)
+            traceback.print_exc()
+            try:
+                await ctx.respond(f"⚠ speak failed: {e}")
+            except Exception:
+                pass
+
     async def privacy_cmd(self, ctx: discord.ApplicationContext):
         await ctx.respond("Privacy Policy: <https://gyerchak.github.io/OpenCode-DiscordBot/privacy-policy.html>")
 
@@ -715,20 +749,35 @@ class ObxBot(discord.Bot):
             self._leave_task = None
 
     async def _join_voice(self, channel):
+        if getattr(self, "_joining", False):
+            return
         if self.voice_room is not None and self.voice_room.vc.is_connected():
             return
-        agent = channel.name[4:].lower() if channel.name.startswith("obx-") else "default"
-        if self.brain.agent(agent) is None:
-            agent = "default"
-        print(f"[obx] joining voice #{channel.name} as agent '{agent}'", flush=True)
+        existing = channel.guild.voice_client
+        if existing is not None and existing.is_connected():
+            # already connected — just ensure a room wraps it (start listening)
+            if self.voice_room is None:
+                agent = channel.name[4:].lower() if channel.name.startswith("obx-") else "default"
+                if self.brain.agent(agent) is None:
+                    agent = "default"
+                print(f"[obx] reusing voice connection as agent '{agent}'", flush=True)
+                self.voice_room = VoiceRoom(self, existing, agent, channel)
+                self.voice_room.start()
+            return
+        self._joining = True
         try:
+            agent = channel.name[4:].lower() if channel.name.startswith("obx-") else "default"
+            if self.brain.agent(agent) is None:
+                agent = "default"
+            print(f"[obx] joining voice #{channel.name} as agent '{agent}'", flush=True)
             vc = await channel.connect()
+            room = VoiceRoom(self, vc, agent, channel)
+            self.voice_room = room
+            room.start()
         except Exception as e:
             print(f"[obx] voice connect failed: {e}", flush=True)
-            return
-        room = VoiceRoom(self, vc, agent, channel)
-        self.voice_room = room
-        room.start()
+        finally:
+            self._joining = False
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -786,6 +835,21 @@ def doctor() -> int:
     return 0 if tok and sess else 1
 
 
+def load_opus_safely() -> bool:
+    if discord.opus.is_loaded():
+        return True
+    for cand in ("/usr/lib/libopus.so.0", "/usr/lib64/libopus.so.0", "/usr/lib/x86_64-linux-gnu/libopus.so.0"):
+        try:
+            discord.opus.load_opus(cand)
+        except Exception:
+            continue
+        if discord.opus.is_loaded():
+            print(f"[obx] libopus loaded ({cand})", flush=True)
+            return True
+    print("[obx] WARN libopus not found — voice playback will fail", flush=True)
+    return False
+
+
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         return doctor()
@@ -795,6 +859,7 @@ def main() -> int:
         return 1
     ensure_whisper()
     ensure_kokoro()
+    load_opus_safely()
     bot = ObxBot()
     try:
         bot.run(tok)
