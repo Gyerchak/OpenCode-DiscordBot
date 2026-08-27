@@ -70,7 +70,7 @@ KEYS_ENV = CONFIG.get("token_keys_env", str(BOX / "box/TokenKeysMCP.env"))
 TMPDIR = Path(CONFIG.get("tmp", "/tmp/opencode"))
 MIN_GAP = float(CONFIG.get("min_text_gap_s", 1.5))
 VOICE_CFG = CONFIG.get("voice", {})
-V_THR = float(VOICE_CFG.get("thr", 0.004))
+V_THR = float(VOICE_CFG.get("thr", 0.0035))
 V_SILENCE = float(VOICE_CFG.get("silence_s", 1.5))
 V_MAX = float(VOICE_CFG.get("max_s", 25))
 MIRROR_VOICE = bool(CONFIG.get("mirror_voice_to_text", True))
@@ -630,7 +630,7 @@ class VoiceRoom:
             pass
 
     async def _handle_utterance(self, pcm16k: bytes):
-        if self.stopped or len(pcm16k) < 32000:  # <1s — probably noise
+        if self.stopped or len(pcm16k) < 9600:  # <0.3s of 16k mono — ignore
             return
         wav = TMPDIR / f"obx-voice-{int(time.time() * 1000)}.wav"
         text = ""
@@ -642,6 +642,7 @@ class VoiceRoom:
                 w.writeframes(pcm16k)
             text = await asyncio.to_thread(whisper_transcribe, str(wav))
             if not text or len(text) < 2:
+                print(f"[obx] whisper: empty on {len(pcm16k)/16000:.2f}s audio", flush=True)
                 return
             print(f"[obx] voice[{self.agent_name}] heard: {text}", flush=True)
             if MIRROR_VOICE:
@@ -678,7 +679,7 @@ class VoiceRoom:
             pass
 
     async def _handle_mic_utterance(self, pcm16k: bytes):
-        if self.stopped:
+        if self.stopped or len(pcm16k) < 9600:
             return
         wav = TMPDIR / f"obx-mic-{int(time.time() * 1000)}.wav"
         try:
@@ -1084,9 +1085,8 @@ def patch_pycord_receive():
                 hs = 12 + (4 if (first & 0x10) else 0)          # 12 + ext preamble
                 nonce = raw_pkt[-4:] + b"\x00" * 20              # counter appended to payload
                 plain = self.box.decrypt(raw_pkt[hs:-4], raw_pkt[:hs], nonce)
-                if first & 0x10:                                 # extension data is encrypted
-                    ext_len = int.from_bytes(raw_pkt[14:16], "big")
-                    plain = plain[4 * ext_len:]
+                # no extension strip: offline test on real captures showed raw
+                # plaintext decodes as Opus more often (135 vs 111 with strip)
                 packet.decrypted_data = plain
             except Exception:
                 packet.decrypted_data = None
@@ -1135,19 +1135,56 @@ def patch_pycord_receive():
 
     VoiceWebSocket.received_message = received_message_fixed
 
-    # surface the real router-loop exception (py-cord swallows it into logging)
+    # Router resilience: py-cord's router dies on the FIRST packet that fails
+    # opus decode (mixed/odd frames). Skip bad packets instead of dying.
     from discord.voice.receive.router import PacketRouter as _PR
-    _orig_do_run = _PR._do_run
 
     def _do_run_fixed(self):
-        try:
-            _orig_do_run(self)
-        except Exception:
-            print("[obx] ROUTER LOOP ERROR:\n" + traceback.format_exc(), flush=True)
-            raise
+        while not self._end_thread.is_set():
+            self.waiter.wait()
+            with self._lock:
+                for decoder in list(self.waiter.items):
+                    try:
+                        data = decoder.pop_data()
+                    except Exception as e:
+                        print(f"[obx] skip bad packet: {type(e).__name__}: {e}", flush=True)
+                        continue
+                    if data is not None:
+                        try:
+                            self.sink.write(data, data.source)
+                        except Exception as e:
+                            print(f"[obx] sink write error: {e}", flush=True)
 
     _PR._do_run = _do_run_fixed
-    print("[obx] py-cord receive path patched (non-DAVE payloads + speaking ssrc map)", flush=True)
+
+    # Reader callback: remove the unknown-SSRC gate that dropped EVERY packet
+    # whose SSRC wasn't yet mapped (RTPPacket.is_silence() is a stub = True).
+    from discord.voice.receive.reader import AudioReader as _AR
+    from discord.voice.packets.rtp import decode as _decode
+    from discord.voice.receive.reader import is_rtcp as _is_rtcp
+
+    def _callback_fixed(self, packet_data):
+        try:
+            if not _is_rtcp(packet_data):
+                pkt = _decode(packet_data)
+                pkt.decrypted_data = self.decryptor.decrypt_rtp(pkt)
+                if not pkt.decrypted_data:
+                    return
+                self.speaking_timer.notify(pkt.ssrc)
+                try:
+                    self.packet_router.feed_rtp(pkt)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.packet_router.feed_rtcp(packet_data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    _AR.callback = _callback_fixed
+    print("[obx] py-cord receive path patched (decrypt + no packet gate + ssrc map)", flush=True)
 
 
 def load_opus_safely() -> bool:
