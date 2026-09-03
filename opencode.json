@@ -299,8 +299,5 @@
   "compaction": {
     "auto": true,
     "buffer": 20000
-  },
-  "websearch": {
-    "provider": "random"
   }
 }
